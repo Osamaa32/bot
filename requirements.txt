@@ -1,0 +1,6 @@
+aiomysql
+python-dotenv
+rapidfuzz
+telethon
+PyMySQL
+cryptg
