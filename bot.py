@@ -2589,6 +2589,13 @@ class BotManager:
             if self.active_bots.get(phone) and self.active_bots[phone].client is client:
                 await self.unregister_running_account(phone, disconnect=False)
 
+    async def _safe_disconnect_client(self, client: TelegramClient, phone: str, reason: str = "") -> None:
+        try:
+            await client.disconnect()
+            await asyncio.sleep(0)
+        except Exception as exc:
+            self.cfg.logger.warning(f"Cleanup disconnect failed for {phone} ({reason}): {exc}")
+
     async def unregister_running_account(self, phone: str, disconnect: bool = True) -> None:
         bot = self.active_bots.pop(phone, None)
         if not bot:
@@ -2600,11 +2607,7 @@ class BotManager:
         self.state.stop_joining_flags.pop(phone, None)
         self.fallback.reset_cache()
         if disconnect:
-            try:
-                if bot.client.is_connected():
-                    await bot.client.disconnect()
-            except Exception:
-                pass
+            await self._safe_disconnect_client(bot.client, phone, reason="unregister_running_account")
         await self.refresh_command_runtime_flags()
 
     async def start_account(self, phone: str) -> Tuple[bool, str]:
@@ -2618,7 +2621,7 @@ class BotManager:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                await client.disconnect()
+                await self._safe_disconnect_client(client, phone, reason="session_not_authorized")
                 await self.db.set_account_error(phone, "Session not authorized")
                 return False, f"لا توجد جلسة صالحة للحساب {phone}. أعد إضافته عبر /accadd أو أكمل التوثيق."
             me = await client.get_me()
@@ -2628,14 +2631,12 @@ class BotManager:
             await self.register_running_account(record, client, me.id)
             return True, f"✅ تم تشغيل الحساب {phone}."
         except AuthKeyDuplicatedError as exc:
+            await self._safe_disconnect_client(client, phone, reason="authkey_duplicated_startup")
             await self.db.set_account_error(phone, "AuthKeyDuplicatedError")
             await self.db.set_account_enabled(phone, False)
             return False, f"AuthKeyDuplicatedError للحساب {phone}. أوقف أي تشغيل آخر لنفس الجلسة ثم أعد التوثيق. التفاصيل: {exc}"
         except Exception as exc:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await self._safe_disconnect_client(client, phone, reason="startup_exception")
             await self.db.set_account_error(phone, str(exc))
             return False, f"فشل تشغيل الحساب {phone}: {exc}"
 
