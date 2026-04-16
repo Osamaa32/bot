@@ -8,6 +8,7 @@ import logging
 import hashlib
 import datetime
 import unicodedata
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -73,6 +74,17 @@ class Config:
         self.DEFAULT_FALLBACK_GROUP_ID: int = int(os.getenv("FALLBACK_GROUP_ID", "-1002353780992"))
         self.DEFAULT_COMMAND_GROUP_ID: int = int(os.getenv("COMMAND_GROUP_ID", "-1002311800895"))
         self.command_bot_index = int(os.getenv("COMMAND_BOT_INDEX", "2"))
+        self.PRIMARY_BOT_TOKEN: str = os.getenv("PRIMARY_BOT_TOKEN", "").strip()
+        self.PRIMARY_BOT_API_ID: int = int(os.getenv("PRIMARY_BOT_API_ID", "0") or 0)
+        self.PRIMARY_BOT_API_HASH: str = os.getenv("PRIMARY_BOT_API_HASH", "").strip()
+        self.PRIMARY_BOT_OWNER_ID: int = int(os.getenv("PRIMARY_BOT_OWNER_ID", "0") or 0)
+        self.PRIMARY_BOT_SESSION: str = os.getenv("PRIMARY_BOT_SESSION", "primary_manager_bot").strip() or "primary_manager_bot"
+        self.MESSAGE_WORKERS: int = max(4, int(os.getenv("MESSAGE_WORKERS", "24") or 24))
+        self.SEND_CONCURRENCY: int = max(4, int(os.getenv("SEND_CONCURRENCY", "32") or 32))
+        self.FALLBACK_CONCURRENCY: int = max(1, int(os.getenv("FALLBACK_CONCURRENCY", "4") or 4))
+        self.ADMIN_CHECK_CONCURRENCY: int = max(1, int(os.getenv("ADMIN_CHECK_CONCURRENCY", "8") or 8))
+        self.INGEST_KEY_TTL_SECONDS: int = max(30, int(os.getenv("INGEST_KEY_TTL_SECONDS", "600") or 600))
+        self.ADMIN_CACHE_TTL_SECONDS: int = max(60, int(os.getenv("ADMIN_CACHE_TTL_SECONDS", "300") or 300))
 
         self.DEFAULT_KEYWORDS = [
             "ابي مساعده", "يسوي", "يحل", "خصوصي", "شاطر", "تحل", "تسوي", "يعرف", "تعرف", "واجب", "بروجكت",
@@ -81,11 +93,11 @@ class Config:
             "ابي حد يحضر عني", "ابغا حد يحضر عني", "يحضر عني", "يحظر", "يحضر",
             "عندي اختبار", "احد عنده خصوصي", "احد يعرف مختص",
             "اسايمنت", "بروجكت", "مشروع", "س ك ل ي ف", "case study", "كيس ستدي",
-            "بوربوينت", "بووربوينت", "عذر طبي", "اجازة مرضية",
+            "بوربوينت", "بووربوينت", "عذر طبي", "اجازة مرضية", "شرح",
         ]
 
         self.COMMANDS = {
-            "help", "cancel", "unblock",
+            "start", "help", "cancel", "unblock",
             "add", "del", "list", "find",
             "blkadd", "blkdel", "blklist", "blkfind",
             "autoadd", "autodel", "autolist", "autofind",
@@ -164,6 +176,16 @@ class PendingAuth:
     client: TelegramClient
     created_at: datetime.datetime
     needs_password: bool = False
+
+
+@dataclass
+class DispatchJob:
+    bot: "Bot"
+    ev: events.NewMessage.Event
+    key: Tuple[Any, ...]
+    text: str
+    keyword_hit: bool
+    enqueued_at: float
 
 
 # =============== DB Layer ===============
@@ -918,6 +940,7 @@ class DbBackupManager:
 class Messenger:
     def __init__(self, logger: logging.Logger) -> None:
         self.logger = logger
+        self.send_semaphore: Optional[asyncio.Semaphore] = None
 
     async def safe_send(
         self,
@@ -937,6 +960,9 @@ class Messenger:
         delay = 1
         for _ in range(3):
             try:
+                if self.send_semaphore is not None:
+                    async with self.send_semaphore:
+                        return await client.send_message(dst, text, parse_mode="Markdown", buttons=buttons)
                 return await client.send_message(dst, text, parse_mode="Markdown", buttons=buttons)
             except FloodWaitError as e:
                 self.logger.warning(f"{tag} wait {e.seconds}s")
@@ -944,7 +970,11 @@ class Messenger:
                 delay *= 2
             except MessageTooLongError:
                 for part in TextUtils.split_long(text, 4000):
-                    await client.send_message(dst, part, parse_mode="Markdown")
+                    if self.send_semaphore is not None:
+                        async with self.send_semaphore:
+                            await client.send_message(dst, part, parse_mode="Markdown")
+                    else:
+                        await client.send_message(dst, part, parse_mode="Markdown")
                 return None
             except UserIsBlockedError:
                 self.logger.warning(f"{tag} blocked by {dst}")
@@ -953,6 +983,7 @@ class Messenger:
                 self.logger.error(f"{tag} error: {ex}", exc_info=True)
                 return None
         return None
+
 
     async def safe_send_file(
         self,
@@ -965,6 +996,9 @@ class Messenger:
         delay = 1
         for _ in range(3):
             try:
+                if self.send_semaphore is not None:
+                    async with self.send_semaphore:
+                        return await client.send_file(dst, file_path, caption=caption, force_document=True)
                 return await client.send_file(dst, file_path, caption=caption, force_document=True)
             except FloodWaitError as e:
                 self.logger.warning(f"{tag} wait {e.seconds}s")
@@ -977,6 +1011,7 @@ class Messenger:
                 self.logger.error(f"{tag} error: {ex}", exc_info=True)
                 return None
         return None
+
 
 
 class GroupRepo:
@@ -1066,10 +1101,12 @@ class State:
         self.blocked_phrases: List[str] = []
         self.auto_replies: List[str] = []
         self._auto_index = 0
+        self._blocked_phrases_norm: Set[str] = set()
 
         self.pending_ops: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.pending_auth: Dict[str, PendingAuth] = {}
         self.COMMAND_USER_ID: Optional[int] = None
+        self.PRIMARY_BOT_OWNER_ID: Optional[int] = None
 
         self.stop_joining_flags: Dict[str, bool] = {}
         self.joining_now: Dict[str, asyncio.Task] = {}
@@ -1079,6 +1116,44 @@ class State:
         self.REPLY_LOCKS: Dict[Tuple[Any, ...], asyncio.Lock] = {}
 
         self.blocked_users: Dict[int, Tuple[str, str]] = {}
+        self.dispatch_queue: asyncio.Queue[DispatchJob] = asyncio.Queue()
+        self.dispatch_workers: List[asyncio.Task] = []
+        self._ingest_lock = asyncio.Lock()
+        self._ingest_seen: Dict[Tuple[Any, ...], float] = {}
+        self._admin_cache: Dict[Tuple[int, int], Tuple[bool, float]] = {}
+        self._admin_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+        self._entity_cache: Dict[Tuple[int, int], Any] = {}
+        self.send_semaphore: Optional[asyncio.Semaphore] = None
+        self.fallback_semaphore: Optional[asyncio.Semaphore] = None
+        self.admin_check_semaphore: Optional[asyncio.Semaphore] = None
+
+    def refresh_runtime_caches(self) -> None:
+        self._blocked_phrases_norm = {TextUtils.normalize_text(p) for p in self.blocked_phrases}
+
+    async def claim_ingest_key(self, key: Tuple[Any, ...], ttl_seconds: int) -> bool:
+        now = time.monotonic()
+        async with self._ingest_lock:
+            if len(self._ingest_seen) > 200000:
+                cutoff = now - ttl_seconds
+                self._ingest_seen = {k: ts for k, ts in self._ingest_seen.items() if ts >= cutoff}
+            ts = self._ingest_seen.get(key)
+            if ts is not None and now - ts < ttl_seconds:
+                return False
+            self._ingest_seen[key] = now
+            return True
+
+    def get_admin_lock(self, key: Tuple[int, int]) -> asyncio.Lock:
+        lock = self._admin_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._admin_locks[key] = lock
+        return lock
+
+    def get_cached_entity(self, client: TelegramClient, user_id: int):
+        return self._entity_cache.get((id(client), user_id))
+
+    def set_cached_entity(self, client: TelegramClient, user_id: int, entity: Any) -> None:
+        self._entity_cache[(id(client), user_id)] = entity
 
     def next_auto_reply(self) -> str:
         if not self.auto_replies:
@@ -1168,20 +1243,27 @@ class FallbackRouter:
         if not src_bot:
             return
 
-        if await self._try_forward_normal(src_bot.client, ev):
-            return
-        for b in self.state.bots:
-            if b.client is src_bot.client:
-                continue
-            if await self._try_forward_normal(b.client, ev):
+        async def _run() -> None:
+            if await self._try_forward_normal(src_bot.client, ev):
                 return
-        if await self._try_forward_textual(src_bot.client, ev, prefix=warn_prefix):
-            return
-        for b in self.state.bots:
-            if b.client is src_bot.client:
-                continue
-            if await self._try_forward_textual(b.client, ev, prefix=warn_prefix):
+            for b in self.state.bots:
+                if b.client is src_bot.client:
+                    continue
+                if await self._try_forward_normal(b.client, ev):
+                    return
+            if await self._try_forward_textual(src_bot.client, ev, prefix=warn_prefix):
                 return
+            for b in self.state.bots:
+                if b.client is src_bot.client:
+                    continue
+                if await self._try_forward_textual(b.client, ev, prefix=warn_prefix):
+                    return
+
+        if self.state.fallback_semaphore is not None:
+            async with self.state.fallback_semaphore:
+                await _run()
+            return
+        await _run()
 
 
 # =============== Bot ===============
@@ -1203,6 +1285,7 @@ class Bot:
         mode: str,
         manager: "BotManager",
         is_command_bot: bool = False,
+        is_primary_manager: bool = False,
         logger: Optional[logging.Logger] = None,
         backup: Optional[DbBackupManager] = None,
     ) -> None:
@@ -1218,6 +1301,7 @@ class Bot:
         self.phone = phone
         self.mode = mode.lower()
         self.is_command_bot = is_command_bot
+        self.is_primary_manager = is_primary_manager
         self.logger = logger or cfg.logger
         self.backup = backup
         self.manager = manager
@@ -1225,12 +1309,115 @@ class Bot:
         self.command_pattern = r"(?i)^/(?:" + "|".join(map(re.escape, sorted(self.cfg.COMMANDS))) + r")\b"
         client.add_event_handler(self._safe_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(self._safe_on_message, events.NewMessage(outgoing=True))
-        client.add_event_handler(self._safe_on_command, events.NewMessage(incoming=True, pattern=self.command_pattern))
-        client.add_event_handler(self._safe_on_command, events.NewMessage(outgoing=True, pattern=self.command_pattern))
+        if self.is_primary_manager:
+            client.add_event_handler(self._safe_on_command, events.NewMessage(incoming=True, pattern=self.command_pattern, func=lambda e: bool(e.is_private)))
+            client.add_event_handler(self._safe_on_command, events.NewMessage(outgoing=True, pattern=self.command_pattern, func=lambda e: bool(e.is_private)))
+        elif self.is_command_bot:
+            client.add_event_handler(self._safe_on_command, events.NewMessage(incoming=True, pattern=self.command_pattern, chats=[self.cfg.COMMAND_GROUP_ID]))
+            client.add_event_handler(self._safe_on_command, events.NewMessage(outgoing=True, pattern=self.command_pattern, chats=[self.cfg.COMMAND_GROUP_ID]))
+
+    def _is_command_context(self, ev: events.NewMessage.Event) -> bool:
+        if self.is_primary_manager:
+            return bool(ev.is_private)
+        return ev.chat_id == self.cfg.COMMAND_GROUP_ID and self.is_command_bot
+
+    async def _authorize_command_access(self, ev: events.NewMessage.Event) -> bool:
+        sender_id = ev.message.sender_id
+        chat_id = ev.chat_id
+        if self.is_primary_manager:
+            if not ev.is_private or not sender_id:
+                return False
+            if self.state.PRIMARY_BOT_OWNER_ID is None:
+                self.state.PRIMARY_BOT_OWNER_ID = sender_id
+                await self.db.set_setting("primary_bot_owner_id", str(sender_id))
+                await self.messenger.safe_send(
+                    self.client,
+                    chat_id,
+                    "✅ تم ربطك كمالك لبوت الإدارة الأساسي. يمكنك الآن التحكم بالحسابات مباشرة عبر الخاص. اكتب /help لعرض الأوامر.",
+                    tag="PRIMARY_BOT",
+                )
+                return True
+            if sender_id != self.state.PRIMARY_BOT_OWNER_ID:
+                await self.messenger.safe_send(self.client, chat_id, "⚠️ هذا البوت الإداري مرتبط بمالك آخر.", tag="PRIMARY_BOT")
+                return False
+            return True
+        if self.state.COMMAND_USER_ID and sender_id != self.state.COMMAND_USER_ID:
+            await self.messenger.safe_send(self.client, chat_id, "⚠️ غير مصرح.", tag="CMD")
+            return False
+        return True
 
     async def _handle_auth_key_duplicated(self, where: str, exc: Exception) -> None:
         self.logger.error(f"AuthKeyDuplicatedError on {where} for {self.phone}: {exc}", exc_info=True)
         await self.manager.handle_auth_key_duplicated(self.phone, where=where, exc=exc)
+
+    def _spawn(self, coro: asyncio.Future, name: str = "bg") -> None:
+        task = asyncio.create_task(coro, name=f"{name}:{self.phone}")
+
+        def _done(t: asyncio.Task) -> None:
+            try:
+                t.result()
+            except AuthKeyDuplicatedError as exc:
+                asyncio.create_task(self._handle_auth_key_duplicated(name, exc))
+            except Exception as exc:
+                self.logger.error(f"Background task {name} failed for {self.phone}: {exc}", exc_info=True)
+
+        task.add_done_callback(_done)
+
+    async def _get_target_entity(self, client: TelegramClient, sender_id: int):
+        cached = self.state.get_cached_entity(client, sender_id)
+        if cached is not None:
+            return cached
+        entity = await client.get_input_entity(sender_id)
+        self.state.set_cached_entity(client, sender_id, entity)
+        return entity
+
+    async def _is_sender_admin_cached(self, ev: events.NewMessage.Event) -> bool:
+        chat_id = ev.chat_id
+        sender_id = ev.message.sender_id
+        if not chat_id or not sender_id:
+            return False
+        cache_key = (chat_id, sender_id)
+        now = time.monotonic()
+        cached = self.state._admin_cache.get(cache_key)
+        if cached and now < cached[1]:
+            return cached[0]
+
+        lock = self.state.get_admin_lock(cache_key)
+        async with lock:
+            now = time.monotonic()
+            cached = self.state._admin_cache.get(cache_key)
+            if cached and now < cached[1]:
+                return cached[0]
+            is_admin = False
+            try:
+                if self.state.admin_check_semaphore is not None:
+                    async with self.state.admin_check_semaphore:
+                        part = await ev.client.get_participant(chat_id, sender_id)
+                else:
+                    part = await ev.client.get_participant(chat_id, sender_id)
+                is_admin = isinstance(part, (ChannelParticipantAdmin, ChannelParticipantCreator))
+            except Exception:
+                is_admin = False
+            self.state._admin_cache[cache_key] = (is_admin, now + self.cfg.ADMIN_CACHE_TTL_SECONDS)
+            return is_admin
+
+    async def _dispatch_forward_to_targets(self, ev: events.NewMessage.Event) -> None:
+        fwd_txt = await self.formatter.build_forward_text(ev)
+        await asyncio.gather(*[
+            self.messenger.safe_send(b.client, b.target_group_id, fwd_txt, tag=f"FWD:{b.phone}")
+            for b in self.state.bots if b.mode in ("forward", "both")
+        ], return_exceptions=True)
+
+    async def _process_dispatch_job(self, job: DispatchJob) -> None:
+        ev = job.ev
+        if await self._is_sender_admin_cached(ev):
+            return
+
+        if self.mode == "self" and job.keyword_hit:
+            fwd = await self.formatter.build_forward_text(ev)
+            await self.messenger.safe_send(self.client, self.target_group_id, fwd, tag="SELFFWD")
+
+        await self.unified_dispatch(ev, key=job.key, text=job.text, keyword_hit=job.keyword_hit)
 
     async def _safe_on_message(self, ev: events.NewMessage.Event) -> None:
         try:
@@ -1308,31 +1495,28 @@ class Bot:
             await self._handle_auth_key_duplicated("user_groups_status", ex)
             return None
 
-    async def unified_dispatch(self, ev: events.NewMessage.Event) -> None:
-        key = self.formatter.message_key(ev)
-        text = ev.message.message or ""
+    async def unified_dispatch(self, ev: events.NewMessage.Event, key: Optional[Tuple[Any, ...]] = None, text: Optional[str] = None, keyword_hit: Optional[bool] = None) -> None:
+        key = key or self.formatter.message_key(ev)
+        text = text if text is not None else (ev.message.message or "")
+        keyword_hit = bool(self.cfg.KW_RE.search(text)) if keyword_hit is None else keyword_hit
 
-        if self.cfg.KW_RE.search(text) and key not in self.state.FORWARD_DONE:
+        if keyword_hit and key not in self.state.FORWARD_DONE:
             self.state.FORWARD_DONE.add(key)
-            fwd_txt = await self.formatter.build_forward_text(ev)
-            await asyncio.gather(*[
-                self.messenger.safe_send(b.client, b.target_group_id, fwd_txt, tag=f"FWD:{b.phone}")
-                for b in self.state.bots if b.mode in ("forward", "both")
-            ], return_exceptions=True)
+            self._spawn(self._dispatch_forward_to_targets(ev), name="forward-targets")
 
         src_bot = next((b for b in self.state.bots if b.client is ev.client), None)
         if not src_bot:
             return
 
-        sender = await ev.get_sender()
-        sender_id = getattr(sender, "id", None)
+        sender = ev.message.sender
+        sender_id = ev.message.sender_id or getattr(sender, "id", None)
         if sender_id and sender_id in self.state.blocked_users:
             return
 
         wants_reply = (
-            self.cfg.KW_RE.search(text)
+            keyword_hit
             and any(TextUtils.fuzzy_match(text, trg) for trg in self.state.direct_triggers)
-            and TextUtils.normalize_text(text) not in {TextUtils.normalize_text(p) for p in self.state.blocked_phrases}
+            and TextUtils.normalize_text(text) not in self.state._blocked_phrases_norm
         )
         if not wants_reply:
             return
@@ -1341,6 +1525,13 @@ class Bot:
         async with lock:
             if key in self.state.REPLY_DONE:
                 return
+
+            if sender is None:
+                try:
+                    sender = await ev.get_sender()
+                except Exception:
+                    sender = None
+            sender_id = sender_id or getattr(sender, "id", None)
 
             dedupe_key = TextUtils.make_dedupe_key(key)
             pending_log_id = 0
@@ -1368,16 +1559,19 @@ class Bot:
                     self.logger.warning(f"auto-replies threshold check failed: {ex}")
 
             self.state.REPLY_DONE.add(key)
-            await self.fallback.forward_any(ev)
+            self._spawn(self.fallback.forward_any(ev), name="fallback-forward")
 
             any_ok = False
             for b in self.state.bots:
                 if b.mode not in ("reply", "both"):
                     continue
                 try:
-                    tgt = sender if b.client is ev.client else await b.client.get_entity(sender.id)
+                    if b.client is ev.client and sender is not None:
+                        tgt = sender
+                    else:
+                        tgt = await self._get_target_entity(b.client, int(sender_id)) if sender_id else None
                 except Exception:
-                    tgt = getattr(sender, "id", None)
+                    tgt = sender_id
                 if not tgt:
                     continue
                 sent_orig = await self.messenger.safe_send(b.client, tgt, text, tag=f"ORIG_REPLY:{b.phone}")
@@ -1394,7 +1588,8 @@ class Bot:
 
             if not any_ok:
                 warn = "⚠️ لم يتم الرد تلقائيًا – سيتم المتابعة يدويًا:"
-                await self.fallback.forward_any(ev, warn_prefix=warn)
+                self._spawn(self.fallback.forward_any(ev, warn_prefix=warn), name="fallback-manual")
+
 
     async def handle_pending(self, ev: events.NewMessage.Event) -> bool:
         chat_id = ev.chat_id
@@ -1403,7 +1598,7 @@ class Bot:
         pending = self.state.pending_ops.get(key)
         if not pending:
             return False
-        if chat_id != self.cfg.COMMAND_GROUP_ID or not self.is_command_bot:
+        if not self._is_command_context(ev):
             return False
 
         text = (ev.message.message or "").strip()
@@ -1777,7 +1972,7 @@ class Bot:
 
     async def on_message(self, ev: events.NewMessage.Event) -> None:
         chat_id, sender_id = ev.chat_id, ev.message.sender_id
-        text = ev.message.message or ""
+        text = (ev.message.message or "").strip()
 
         if await self.handle_pending(ev):
             return
@@ -1785,6 +1980,8 @@ class Bot:
         if chat_id == self.cfg.COMMAND_GROUP_ID and text.startswith("/"):
             return
 
+        if not text:
+            return
         if text.startswith("✉") or ev.is_private or ev.out or chat_id in self.cfg.EXCLUDED_GROUPS:
             return
         if any([re.search(r"@\w{5,}", text), re.search(r"https?://\S+", text), len(text.split()) > 17, re.search(r"\d", text)]):
@@ -1792,20 +1989,26 @@ class Bot:
         sender = ev.message.sender
         if getattr(sender, "bot", False):
             return
-        try:
-            part = await ev.client.get_participant(chat_id, sender_id)
-            if isinstance(part, (ChannelParticipantAdmin, ChannelParticipantCreator)):
-                return
-        except Exception:
-            pass
 
-        if self.mode == "self":
-            if self.cfg.KW_RE.search(text):
-                fwd = await self.formatter.build_forward_text(ev)
-                await self.messenger.safe_send(self.client, self.target_group_id, fwd, tag="SELFFWD")
-            await self.unified_dispatch(ev)
-        else:
-            await self.unified_dispatch(ev)
+        keyword_hit = bool(self.cfg.KW_RE.search(text))
+        if not keyword_hit:
+            return
+
+        key = self.formatter.message_key(ev)
+        if self.mode != "self":
+            claimed = await self.state.claim_ingest_key(key, self.cfg.INGEST_KEY_TTL_SECONDS)
+            if not claimed:
+                return
+
+        await self.state.dispatch_queue.put(DispatchJob(
+            bot=self,
+            ev=ev,
+            key=key,
+            text=text,
+            keyword_hit=keyword_hit,
+            enqueued_at=time.monotonic(),
+        ))
+
 
     async def on_command(self, ev: events.NewMessage.Event) -> None:
         chat_id, sender_id = ev.chat_id, ev.message.sender_id
@@ -1814,15 +2017,21 @@ class Bot:
         cmd = parts[0].lstrip("/").lower()
         arg = parts[1] if len(parts) > 1 else ""
 
-        if chat_id != self.cfg.COMMAND_GROUP_ID:
+        if not self._is_command_context(ev):
             return
-        if not self.is_command_bot:
-            return
-        if self.state.COMMAND_USER_ID and sender_id != self.state.COMMAND_USER_ID:
-            await self.messenger.safe_send(self.client, chat_id, "⚠️ غير مصرح.", tag="CMD")
+        if not await self._authorize_command_access(ev):
             return
         if cmd not in self.cfg.COMMANDS:
             await self.messenger.safe_send(self.client, chat_id, "⚠️ أمر غير معروف. اكتب /help.", tag="CMD")
+            return
+
+        if cmd == "start":
+            intro = (
+                "✅ بوت الإدارة الأساسي جاهز.\n\n"
+                "إذا كان الحساب لا يملك جلسة أو جلسته تالفة، استخدم /accadd لإضافة حساب جديد أو /accstart <phone> ليحاول التشغيل ثم يبدأ التوثيق تلقائيًا عند الحاجة.\n\n"
+                "اكتب /help لعرض جميع الأوامر."
+            )
+            await self.messenger.safe_send(self.client, chat_id, intro, tag="CMD")
             return
 
         if cmd == "cancel":
@@ -1970,7 +2179,14 @@ class Bot:
                 return
             phone = TextUtils.normalize_phone(arg.strip())
             ok, msg = await self.manager.start_account(phone)
-            await self.messenger.safe_send(self.client, chat_id, msg if ok else f"⚠️ {msg}", tag="CMD")
+            if ok:
+                await self.messenger.safe_send(self.client, chat_id, msg, tag="CMD")
+                return
+            if "لا توجد جلسة صالحة" in msg or "Session not authorized" in msg:
+                ok2, msg2 = await self.manager.begin_account_reauth(phone)
+                await self.messenger.safe_send(self.client, chat_id, msg2 if ok2 else f"⚠️ {msg2}", tag="CMD")
+                return
+            await self.messenger.safe_send(self.client, chat_id, f"⚠️ {msg}", tag="CMD")
             return
 
         if cmd == "accstop":
@@ -2368,7 +2584,7 @@ class Bot:
             help_text = (
                 "✨ **أوامر البوت المطوّرة** ✨\n\n"
                 "**الإدارة العامة**\n"
-                "• /stats\n• /configshow\n• /cancel\n\n"
+                "• /start\n• /stats\n• /configshow\n• /cancel\n\n"
                 "**إدارة الحسابات**\n"
                 "• /accadd\n• /acccode\n• /accpass\n• /acclist\n• /accstart\n• /accstop\n• /accrestart\n• /accmode\n• /acctarget\n• /accsetcmd\n• /accdel\n\n"
                 "**الكلمات الأساسية والجروبات المستبعدة**\n"
@@ -2387,7 +2603,7 @@ class Bot:
                 "**السجل والحظر**\n"
                 "• /blkuser_add /blkuser_del /blkuser_list /blkuser_find\n"
                 "• /autoreplies_count /autoreplies_list /autoreplies_clear\n\n"
-                "**ملاحظة:** لم يتم المساس بمنطق التحويل والرد التلقائي؛ الإضافات ركزت على الإدارة والتحكم والنسخ الاحتياطي."
+                "**ملاحظة:** لم يتم المساس بمنطق التحويل والرد التلقائي؛ الإضافات ركزت على الإدارة والتحكم والنسخ الاحتياطي، ويمكن تنفيذ الأوامر الأساسية أيضًا عبر بوت الإدارة الأساسي في الخاص."
             )
             await self.messenger.safe_send(self.client, chat_id, help_text, tag="CMD")
             return
@@ -2425,6 +2641,32 @@ class BotManager:
         self.run_tasks: Dict[str, asyncio.Task] = {}
         self.account_me_ids: Dict[str, int] = {}
         self._duplicate_auth_locks: Dict[str, asyncio.Lock] = {}
+        self.primary_manager_bot: Optional[Bot] = None
+        self.primary_manager_client: Optional[TelegramClient] = None
+        self.primary_manager_task: Optional[asyncio.Task] = None
+
+    async def dispatch_worker(self, worker_no: int) -> None:
+        self.cfg.logger.info(f"Dispatch worker {worker_no} started")
+        while True:
+            job = await self.state.dispatch_queue.get()
+            try:
+                await job.bot._process_dispatch_job(job)
+            except AuthKeyDuplicatedError as exc:
+                await job.bot._handle_auth_key_duplicated(f"dispatch_worker:{worker_no}", exc)
+            except Exception as exc:
+                self.cfg.logger.error(f"Dispatch worker {worker_no} failed: {exc}", exc_info=True)
+            finally:
+                self.state.dispatch_queue.task_done()
+
+    async def start_dispatch_workers(self) -> None:
+        if self.state.dispatch_workers:
+            return
+        self.state.send_semaphore = asyncio.Semaphore(self.cfg.SEND_CONCURRENCY)
+        self.state.fallback_semaphore = asyncio.Semaphore(self.cfg.FALLBACK_CONCURRENCY)
+        self.state.admin_check_semaphore = asyncio.Semaphore(self.cfg.ADMIN_CHECK_CONCURRENCY)
+        self.messenger.send_semaphore = self.state.send_semaphore
+        for i in range(self.cfg.MESSAGE_WORKERS):
+            self.state.dispatch_workers.append(asyncio.create_task(self.dispatch_worker(i + 1), name=f"dispatch-worker-{i + 1}"))
 
     def session_name(self, phone: str) -> str:
         digits = re.sub(r"\D+", "", phone)
@@ -2493,6 +2735,71 @@ class BotManager:
             if rows:
                 await self.db.set_command_bot(rows[0]["phone"])
 
+    async def _pick_primary_bot_api_credentials(self) -> Tuple[int, str]:
+        if self.cfg.PRIMARY_BOT_API_ID and self.cfg.PRIMARY_BOT_API_HASH:
+            return self.cfg.PRIMARY_BOT_API_ID, self.cfg.PRIMARY_BOT_API_HASH
+        rows = await self.db.list_accounts()
+        for row in rows:
+            try:
+                api_id = int(row["api_id"] or 0)
+            except Exception:
+                api_id = 0
+            api_hash = str(row.get("api_hash") or "").strip()
+            if api_id and api_hash:
+                return api_id, api_hash
+        return 0, ""
+
+    async def start_primary_manager_bot(self) -> None:
+        if not self.cfg.PRIMARY_BOT_TOKEN:
+            self.cfg.logger.info("Primary management bot token not configured; skipping dedicated manager bot startup")
+            return
+        if self.primary_manager_bot:
+            return
+        api_id, api_hash = await self._pick_primary_bot_api_credentials()
+        if not api_id or not api_hash:
+            self.cfg.logger.warning("PRIMARY_BOT_TOKEN موجود لكن لا يوجد PRIMARY_BOT_API_ID/HASH ولا أي بيانات API مخزنة للحسابات، لذلك لن يبدأ بوت الإدارة الأساسي بعد.")
+            return
+        client = TelegramClient(self.cfg.PRIMARY_BOT_SESSION, api_id, api_hash)
+        try:
+            await client.start(bot_token=self.cfg.PRIMARY_BOT_TOKEN)
+            me = await client.get_me()
+            bot = Bot(
+                cfg=self.cfg,
+                db=self.db,
+                state=self.state,
+                messenger=self.messenger,
+                group_repo=self.group_repo,
+                formatter=self.formatter,
+                fallback=self.fallback,
+                client=client,
+                target_group_id=self.cfg.COMMAND_GROUP_ID,
+                phone=f"primary_bot:{getattr(me, 'username', None) or me.id}",
+                mode="self",
+                manager=self,
+                is_command_bot=False,
+                is_primary_manager=True,
+                logger=self.cfg.logger,
+                backup=self.backup,
+            )
+            self.primary_manager_client = client
+            self.primary_manager_bot = bot
+            self.primary_manager_task = asyncio.create_task(self._primary_bot_runner(client))
+            self.cfg.logger.info(f"Primary management bot started: @{getattr(me, 'username', None) or me.id}")
+        except Exception as exc:
+            await self._safe_disconnect_client(client, "primary_manager_bot", reason="primary_manager_startup")
+            self.cfg.logger.error(f"Failed to start primary management bot: {exc}", exc_info=True)
+
+    async def _primary_bot_runner(self, client: TelegramClient) -> None:
+        try:
+            await client.run_until_disconnected()
+        except Exception as exc:
+            self.cfg.logger.error(f"Primary management bot runtime error: {exc}", exc_info=True)
+        finally:
+            if self.primary_manager_client is client:
+                self.primary_manager_task = None
+                self.primary_manager_bot = None
+                self.primary_manager_client = None
+
     async def reload_runtime_state(self) -> None:
         self.state.direct_triggers = await self.db.scalar_table_values("direct_reply_messages", "message_text")
         self.state.blocked_phrases = await self.db.scalar_table_values("blocked_reply_messages", "message_text")
@@ -2508,10 +2815,19 @@ class BotManager:
 
         fallback_val = await self.db.get_setting("fallback_group_id")
         command_val = await self.db.get_setting("command_group_id")
+        owner_val = await self.db.get_setting("primary_bot_owner_id")
         if fallback_val:
             self.cfg.FALLBACK_GROUP_ID = int(fallback_val)
         if command_val:
             self.cfg.COMMAND_GROUP_ID = int(command_val)
+        if owner_val:
+            self.state.PRIMARY_BOT_OWNER_ID = int(owner_val)
+        elif self.cfg.PRIMARY_BOT_OWNER_ID:
+            self.state.PRIMARY_BOT_OWNER_ID = self.cfg.PRIMARY_BOT_OWNER_ID
+            await self.db.set_setting("primary_bot_owner_id", str(self.cfg.PRIMARY_BOT_OWNER_ID))
+        else:
+            self.state.PRIMARY_BOT_OWNER_ID = None
+        self.state.refresh_runtime_caches()
         self.fallback.reset_cache()
         await self.refresh_command_runtime_flags()
         self.cfg.logger.info("Loaded runtime settings, stores, blocked users")
@@ -2720,6 +3036,39 @@ class BotManager:
             return True, f"✅ تم حذف الحساب {phone}" + (" مع ملفات الجلسة." if purge_session else ".")
         return False, f"تعذر حذف الحساب {phone}"
 
+    async def begin_account_reauth(self, phone: str) -> Tuple[bool, str]:
+        phone = TextUtils.normalize_phone(phone)
+        record = await self.db.get_account(phone)
+        if not record:
+            return False, f"الحساب غير مسجل: {phone}"
+        if phone in self.state.pending_auth:
+            return True, f"⚠️ يوجد طلب توثيق معلّق لهذا الرقم: {phone}"
+        if phone in self.active_bots:
+            return True, f"✅ الحساب شغال بالفعل: {phone}"
+        session_name = str(record["session_name"] or self.session_name(phone))
+        client = TelegramClient(session_name, int(record["api_id"]), record["api_hash"])
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            self.state.pending_auth[phone] = PendingAuth(
+                phone=phone,
+                api_id=int(record["api_id"]),
+                api_hash=record["api_hash"],
+                target_group_id=int(record["target_group_id"]),
+                mode=str(record["mode"] or "both").lower(),
+                is_command_bot=bool(record["is_command_bot"]),
+                session_name=session_name,
+                phone_code_hash=sent.phone_code_hash,
+                client=client,
+                created_at=datetime.datetime.utcnow(),
+                needs_password=False,
+            )
+            return True, f"📩 لا توجد جلسة صالحة للحساب `{phone}`، لذلك بدأنا التوثيق تلقائيًا. أرسل الآن `/acccode {phone} 12345` أو استخدم `/acccode` ثم أرسل الكود فقط."
+        except Exception as exc:
+            await self._safe_disconnect_client(client, phone, reason="begin_account_reauth")
+            await self.db.set_account_error(phone, str(exc))
+            return False, f"فشل بدء إعادة التوثيق للحساب {phone}: {exc}"
+
     async def complete_account_login(self, pending: PendingAuth) -> None:
         if pending.is_command_bot:
             await self.db.set_command_bot(pending.phone)
@@ -2764,8 +3113,10 @@ class BotManager:
         await self.sync_env_accounts_to_db()
         await self.seed_defaults()
         await self.reload_runtime_state()
+        await self.start_dispatch_workers()
+        await self.start_primary_manager_bot()
         await self.start_enabled_accounts()
-        self.cfg.logger.info("Bot manager started")
+        self.cfg.logger.info(f"Bot manager started with {self.cfg.MESSAGE_WORKERS} dispatch workers")
         await asyncio.Event().wait()
 
 
