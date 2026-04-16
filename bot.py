@@ -1223,10 +1223,30 @@ class Bot:
         self.manager = manager
 
         self.command_pattern = r"(?i)^/(?:" + "|".join(map(re.escape, sorted(self.cfg.COMMANDS))) + r")\b"
-        client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
-        client.add_event_handler(self.on_message, events.NewMessage(outgoing=True))
-        client.add_event_handler(self.on_command, events.NewMessage(incoming=True, pattern=self.command_pattern))
-        client.add_event_handler(self.on_command, events.NewMessage(outgoing=True, pattern=self.command_pattern))
+        client.add_event_handler(self._safe_on_message, events.NewMessage(incoming=True))
+        client.add_event_handler(self._safe_on_message, events.NewMessage(outgoing=True))
+        client.add_event_handler(self._safe_on_command, events.NewMessage(incoming=True, pattern=self.command_pattern))
+        client.add_event_handler(self._safe_on_command, events.NewMessage(outgoing=True, pattern=self.command_pattern))
+
+    async def _handle_auth_key_duplicated(self, where: str, exc: Exception) -> None:
+        self.logger.error(f"AuthKeyDuplicatedError on {where} for {self.phone}: {exc}", exc_info=True)
+        await self.manager.handle_auth_key_duplicated(self.phone, where=where, exc=exc)
+
+    async def _safe_on_message(self, ev: events.NewMessage.Event) -> None:
+        try:
+            await self.on_message(ev)
+        except AuthKeyDuplicatedError as exc:
+            await self._handle_auth_key_duplicated("on_message", exc)
+        except Exception as exc:
+            self.logger.error(f"Unhandled on_message error for {self.phone}: {exc}", exc_info=True)
+
+    async def _safe_on_command(self, ev: events.NewMessage.Event) -> None:
+        try:
+            await self.on_command(ev)
+        except AuthKeyDuplicatedError as exc:
+            await self._handle_auth_key_duplicated("on_command", exc)
+        except Exception as exc:
+            self.logger.error(f"Unhandled on_command error for {self.phone}: {exc}", exc_info=True)
 
     async def join_sleep(self, phone: str, seconds: int) -> None:
         for _ in range(seconds):
@@ -1250,6 +1270,9 @@ class Bot:
                     joined += 1
                     await self.messenger.safe_send(self.client, self.cfg.COMMAND_GROUP_ID, f"✅ [{idx + 1}/{total}] انضم: {link}", tag="JOIN_GROUPS")
                     await self.join_sleep(self.phone, 250)
+                except AuthKeyDuplicatedError as ex:
+                    await self._handle_auth_key_duplicated("join_groups_with_account", ex)
+                    return
                 except UserAlreadyParticipantError:
                     await self.messenger.safe_send(self.client, self.cfg.COMMAND_GROUP_ID, f"ℹ️ [{idx + 1}/{total}] عضو مسبقاً: {link}", tag="JOIN_GROUPS")
                 except FloodWaitError as e:
@@ -1262,21 +1285,28 @@ class Bot:
             self.state.stop_joining_flags.pop(self.phone, None)
         await self.messenger.safe_send(self.client, self.cfg.COMMAND_GROUP_ID, f"🏁 {self.phone}: انضم {joined}/{total}.", tag="JOIN_GROUPS")
 
-    async def user_groups_status(self) -> Tuple[List[str], List[str]]:
+    async def user_groups_status(self) -> Optional[Tuple[List[str], List[str]]]:
         links = await self.group_repo.all()
         in_groups, not_in = [], []
-        me = await self.client.get_me()
-        for link in links:
-            try:
-                entity = await self.client.get_entity(link)
-                result = await self.client(GetParticipantRequest(entity, me.id))
-                if isinstance(result.participant, (ChannelParticipant, ChannelParticipantSelf, ChannelParticipantAdmin, ChannelParticipantCreator)):
-                    in_groups.append(link)
-                else:
+        try:
+            me = await self.client.get_me()
+            for link in links:
+                try:
+                    entity = await self.client.get_entity(link)
+                    result = await self.client(GetParticipantRequest(entity, me.id))
+                    if isinstance(result.participant, (ChannelParticipant, ChannelParticipantSelf, ChannelParticipantAdmin, ChannelParticipantCreator)):
+                        in_groups.append(link)
+                    else:
+                        not_in.append(link)
+                except AuthKeyDuplicatedError as ex:
+                    await self._handle_auth_key_duplicated("user_groups_status", ex)
+                    return None
+                except Exception:
                     not_in.append(link)
-            except Exception:
-                not_in.append(link)
-        return in_groups, not_in
+            return in_groups, not_in
+        except AuthKeyDuplicatedError as ex:
+            await self._handle_auth_key_duplicated("user_groups_status", ex)
+            return None
 
     async def unified_dispatch(self, ev: events.NewMessage.Event) -> None:
         key = self.formatter.message_key(ev)
@@ -1508,7 +1538,11 @@ class Bot:
             if not target_bot:
                 await self.messenger.safe_send(self.client, chat_id, f"⚠️ الحساب غير موجود أو غير شغال: {phone}", tag="CMD")
                 return True
-            in_g, not_in = await target_bot.user_groups_status()
+            status = await target_bot.user_groups_status()
+            if status is None:
+                await self.messenger.safe_send(self.client, chat_id, f"⛔️ تم إيقاف الحساب {phone} لأن الجلسة صارت غير صالحة بسبب استخدامها من IP آخر. أعد إنشاء الجلسة لهذا الرقم.", tag="CMD")
+                return True
+            in_g, not_in = status
             msg = f"🔢 **{phone} عضو في {len(in_g)} من {len(in_g) + len(not_in)} جروب.**\n❌ خارجها: {len(not_in)}"
             await self.messenger.safe_send(self.client, chat_id, msg, tag="CMD")
             return True
@@ -2390,6 +2424,7 @@ class BotManager:
         self.active_bots: Dict[str, Bot] = {}
         self.run_tasks: Dict[str, asyncio.Task] = {}
         self.account_me_ids: Dict[str, int] = {}
+        self._duplicate_auth_locks: Dict[str, asyncio.Lock] = {}
 
     def session_name(self, phone: str) -> str:
         digits = re.sub(r"\D+", "", phone)
@@ -2487,6 +2522,34 @@ class BotManager:
         for phone, bot in self.active_bots.items():
             bot.is_command_bot = (phone == cmd_phone)
 
+    def _dup_lock(self, phone: str) -> asyncio.Lock:
+        lock = self._duplicate_auth_locks.get(phone)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._duplicate_auth_locks[phone] = lock
+        return lock
+
+    async def handle_auth_key_duplicated(self, phone: str, where: str = "runtime", exc: Optional[Exception] = None) -> str:
+        phone = TextUtils.normalize_phone(phone)
+        async with self._dup_lock(phone):
+            await self.db.set_account_error(phone, "AuthKeyDuplicatedError")
+            await self.db.set_account_enabled(phone, False)
+            if phone in self.active_bots:
+                await self.unregister_running_account(phone, disconnect=True)
+
+            msg = (
+                f"⛔️ تم إيقاف الحساب `{phone}` تلقائيًا لأن جلسة Telethon أصبحت غير صالحة "
+                f"بسبب استخدامها من عنواني IP مختلفين في نفس الوقت.\n"
+                f"الموضع: `{where}`\n"
+                "الحل: أوقف أي تشغيل آخر لنفس الجلسة، ثم احذف/أعد إنشاء الجلسة لهذا الحساب عبر /accadd ثم /acccode وربما /accpass."
+            )
+            self.cfg.logger.error(f"Duplicated authorization detected for {phone} at {where}: {exc or 'n/a'}")
+
+            notifier = next((b for p, b in self.active_bots.items() if p != phone and b.is_command_bot), None)
+            if notifier:
+                await self.messenger.safe_send(notifier.client, self.cfg.COMMAND_GROUP_ID, msg, tag="AUTHKEY_DUP")
+            return msg
+
     async def register_running_account(self, record: Dict[str, Any], client: TelegramClient, me_id: int) -> None:
         phone = record["phone"]
         if phone in self.active_bots:
@@ -2518,6 +2581,8 @@ class BotManager:
     async def _client_runner(self, phone: str, client: TelegramClient) -> None:
         try:
             await client.run_until_disconnected()
+        except AuthKeyDuplicatedError as exc:
+            await self.handle_auth_key_duplicated(phone, where="client_runner", exc=exc)
         except Exception as exc:
             self.cfg.logger.error(f"Client runner error for {phone}: {exc}", exc_info=True)
         finally:
@@ -2562,9 +2627,10 @@ class BotManager:
             record["enabled"] = 1
             await self.register_running_account(record, client, me.id)
             return True, f"✅ تم تشغيل الحساب {phone}."
-        except AuthKeyDuplicatedError:
+        except AuthKeyDuplicatedError as exc:
             await self.db.set_account_error(phone, "AuthKeyDuplicatedError")
-            return False, f"AuthKeyDuplicatedError للحساب {phone}. احذف ملف الجلسة ثم أعد التوثيق."
+            await self.db.set_account_enabled(phone, False)
+            return False, f"AuthKeyDuplicatedError للحساب {phone}. أوقف أي تشغيل آخر لنفس الجلسة ثم أعد التوثيق. التفاصيل: {exc}"
         except Exception as exc:
             try:
                 await client.disconnect()
@@ -2711,3 +2777,22 @@ if __name__ == "__main__":
     except Exception:
         AppLogger.build().exception("❌ Fatal error in main()", exc_info=True)
         raise
+
+
+# ===== Compatibility aliases for existing external references =====
+DB.load_table = lambda self, name: self.scalar_table_values(name, "message_text") if name != "join_groups" else self.scalar_table_values(name, "group_link")
+DB.insert_table = lambda self, name, text: self.insert_scalar_value(name, "message_text", text)
+DB.delete_table = lambda self, name, text: self.delete_scalar_value(name, "message_text", text)
+
+
+# Preserve alias names expected by the old code paths
+async def _compat_join_groups_load(db: DB) -> List[str]:
+    return await db.scalar_table_values("join_groups", "group_link")
+
+GroupRepo.load_all = GroupRepo.all
+
+
+# Telethon / runtime note:
+# command handling, account start/stop, backup merge restore, keywords, excluded groups,
+# fallback group, and command group are now DB-backed and runtime-refreshable.
+
